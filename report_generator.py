@@ -9,10 +9,18 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agentbricks.utils.logger_util import logger
 from api_client import ActionAPIClient
+from rag_store import (
+    REDACTION_PATTERNS as RAG_REDACTION_PATTERNS,
+    RagStore,
+    RagStoreError,
+)
+
+_RAG_STORE: Optional[RagStore] = None
+_RAG_DISABLED = False
 
 
 def _format_timestamp(ts: Optional[float]) -> str:
@@ -27,6 +35,95 @@ def _sanitize_filename(value: str) -> str:
     """Return safe string for filenames."""
     safe = re.sub(r"[^\w.-]", "_", value, flags=re.ASCII)
     return safe or "report"
+
+
+def _get_rag_store() -> Optional[RagStore]:
+    global _RAG_STORE, _RAG_DISABLED
+    if _RAG_DISABLED:
+        return None
+    if _RAG_STORE is None:
+        try:
+            _RAG_STORE = RagStore()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("初始化 RagStore 失败，将禁用 RAG：%s", exc)
+            _RAG_DISABLED = True
+            return None
+    return _RAG_STORE
+
+
+def _redact_sensitive_text(value: str) -> str:
+    sanitized = value or ""
+    for pattern in RAG_REDACTION_PATTERNS:
+        sanitized = pattern.sub("<REDACTED>", sanitized)
+    return sanitized
+
+
+def _prepare_events_for_rag(
+    events: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    sanitized_events: List[Dict[str, Any]] = []
+    for event in events:
+        payload = (event.get("payload") or {}).copy()
+        if "text" in payload and isinstance(payload["text"], str):
+            payload["text"] = _redact_sensitive_text(payload["text"])
+        if "message" in payload and isinstance(payload["message"], str):
+            payload["message"] = _redact_sensitive_text(payload["message"])
+        sanitized_events.append(
+            {
+                "timestamp": event.get("timestamp"),
+                "sequence_number": event.get("sequence_number"),
+                "payload": payload,
+            }
+        )
+    return sanitized_events
+
+
+def _determine_rag_top_k() -> int:
+    try:
+        return max(1, int(os.getenv("RAG_TOP_K", "5")))
+    except ValueError:
+        return 5
+
+
+def _summarize_evidence(evidence: List[Dict[str, Any]]) -> str:
+    if not evidence:
+        return "Evidence:\n(未检索到可引用的历史记录，请在报告中说明证据缺失)"
+    lines = ["Evidence:"]
+    for idx, item in enumerate(evidence, start=1):
+        seq = item.get("sequence_number", "-")
+        timestamp = item.get("timestamp", "-")
+        text = str(item.get("text") or "").replace("\n", " ").strip()
+        if len(text) > 180:
+            text = f"{text[:177].rstrip()}..."
+        lines.append(f"{idx}) [seq={seq}|{timestamp}] {text}")
+    return "\n".join(lines)
+
+
+async def _collect_rag_context(
+    events: List[Dict[str, Any]],
+    user_id: str,
+    chat_id: str,
+    instruction: str,
+    final_summary: str,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    rag_store = _get_rag_store()
+    if not rag_store:
+        return [], True
+    try:
+        await rag_store.index_events(user_id, chat_id, events)
+        query = (instruction or final_summary or "").strip()
+        if not query:
+            return [], False
+        evidence = await rag_store.retrieve(
+            query=query,
+            top_k=_determine_rag_top_k(),
+        )
+        return evidence, False
+    except RagStoreError as exc:
+        logger.error("RAG 存储失败：%s", exc)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("RAG 未知错误：%s", exc)
+    return [], True
 
 
 def _extract_instruction(events: List[Dict[str, Any]]) -> str:
@@ -87,7 +184,10 @@ def _extract_final(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {"raw": text}
 
 
-def _generate_llm_markdown(payload: Dict[str, Any]) -> Optional[str]:
+def _generate_llm_markdown(
+    payload: Dict[str, Any],
+    evidence_block: Optional[str] = None,
+) -> Optional[str]:
     api_key = (
         os.getenv("DASHSCOPE_API_KEY")
         or os.getenv("OPENAI_API_KEY")
@@ -118,12 +218,22 @@ def _generate_llm_markdown(payload: Dict[str, Any]) -> Optional[str]:
         "4. Replace technical details—like JSON fields or raw coordinates—with intuitive descriptions (e.g., “clicked "
         "the Start menu,” “located the Edge icon on the taskbar”).\n"
         "5. End with “**Result:**” summarizing the outcome.\n"
-        "6. Keep the tone professional, concise, and easy to visualize."
+        "6. Keep the tone professional, concise, and easy to visualize.\n"
+        "7. When a statement relies on evidence, append a citation such as “(evidence #2)” or “[source: seq=3]”. "
+        "Do not fabricate citations.\n"
+        "8. Abstract evidence instead of copying verbatim sentences, highlighting only what supports the conclusion."
+    )
+
+    evidence_section = evidence_block or (
+        "Evidence:\n(无可用证据，需在报告中说明数据受限)"
     )
 
     user_prompt = (
-        "You will receive the raw log content below. Please transform it into the human-readable document described "
-        "in the requirements:\n"
+        "You will receive the raw log content below as well as a concise evidence section. "
+        "Use the evidence to justify conclusions and always cite it by number. "
+        "If evidence is missing for a conclusion, explicitly state the limitation instead of guessing.\n\n"
+        f"{evidence_section}\n\n"
+        "Raw Logs:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
@@ -329,6 +439,18 @@ async def generate_human_report(
         f"curl -o report.md 'http://127.0.0.1:8002/cua/report?user_id={sample_user}&chat_id={sample_chat}'",
     ]
 
+    rag_ready_events = _prepare_events_for_rag(processed)
+    rag_evidence: List[Dict[str, Any]] = []
+    rag_failed = False
+    if rag_ready_events:
+        rag_evidence, rag_failed = await _collect_rag_context(
+            rag_ready_events,
+            user_id or "unknown_user",
+            chat_id or "session",
+            instruction,
+            final_summary,
+        )
+
     llm_payload = {
         "user_id": user_id,
         "chat_id": chat_id,
@@ -344,7 +466,13 @@ async def generate_human_report(
         "sample_commands": sample_commands,
     }
 
-    llm_markdown = _generate_llm_markdown(llm_payload)
+    evidence_block = _summarize_evidence(rag_evidence)
+    llm_markdown = None
+    if not rag_failed:
+        llm_markdown = _generate_llm_markdown(
+            llm_payload,
+            evidence_block=evidence_block,
+        )
     if llm_markdown:
         try:
             report_path.write_text(llm_markdown, encoding="utf-8")
