@@ -1,0 +1,5 @@
+agentbricks[sandbox]@ http://dashscope-cn-beijing.oss-cn-beijing.aliyuncs.com/bailiansdk-agent-wy/code/agentbricks-0.7.1-py3-none-any.whl
+agentscope-runtime
+mcp==1.8.0
+dotenv
+redis

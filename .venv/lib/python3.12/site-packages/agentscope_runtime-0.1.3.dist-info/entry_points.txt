@@ -1,0 +1,4 @@
+[console_scripts]
+runtime-sandbox-builder = agentscope_runtime.sandbox.build:main
+runtime-sandbox-mcp = agentscope_runtime.sandbox.mcp_server:main
+runtime-sandbox-server = agentscope_runtime.sandbox.manager.server.app:main
