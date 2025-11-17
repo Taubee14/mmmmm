@@ -3,3 +3,8 @@ agentscope-runtime
 mcp==1.8.0
 dotenv
 redis
+openai>=1.14.0
+chromadb>=0.4.24
+sentence-transformers>=2.5.1
+faiss-cpu; sys_platform != "win32"
+pytest>=8.0.0
